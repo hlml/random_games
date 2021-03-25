@@ -3,8 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
+#https://discuss.pytorch.org/t/positive-weights/19701/3
+class PositiveLinear(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(PositiveLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.log_weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.reset_parameters()
 
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.log_weight)
 
+    def forward(self, input):
+        return nn.functional.linear(input, self.log_weight.exp())
+#         return nn.functional.linear(input,torch.softmax(self.log_weight,1))
+    
 class LeNet(nn.Module):
     def __init__(self):
         super(LeNet, self).__init__()
@@ -20,6 +34,76 @@ class LeNet(nn.Module):
 #         x = self.fc3(x)
         return x
 
+class MnistConvNet(nn.Module):
+    def __init__(self, flatten = True):
+        super(MnistConvNet,self).__init__()
+        trunk = []
+#         for i in range(depth):
+#             indim = 1 if i == 0 else 64
+#             outdim = 64
+        A = ConvBlock(1, 32, pool = True) #only pooling for fist 4 layers
+        trunk.append(A)
+        B = ConvBlock(32, 16, pool = True) #only pooling for fist 4 layers
+        trunk.append(B)
+
+        if flatten:
+            trunk.append(Flatten())
+        trunk.append(nn.Linear(784, 100))
+        self.trunk = nn.Sequential(*trunk)
+        self.final_feat_dim = 100
+
+    def forward(self,x):
+        out = self.trunk(x)
+        return out
+    
+class RandomGamePos(nn.Module):
+    def __init__(self, model_func, num_class, loss_type = 'softmax'):
+        super(RandomGamePos, self).__init__()
+        self.feature    = model_func()
+        
+        self.true_classifier = nn.Linear(self.feature.final_feat_dim, num_class, bias=True)
+        self.rand_classifier = nn.Linear(self.feature.final_feat_dim, num_class, bias=True)
+#         self.rand_classifier = PositiveLinear(self.feature.final_feat_dim, num_class)
+        self.num_class = num_class
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, x, true_flag):
+        embedding  = self.feature.forward(x)
+        
+        if true_flag:
+            out = self.true_classifier.forward(embedding)
+        else:
+            out = self.rand_classifier.forward(embedding)
+        return out
+    
+    def train_rand(self):
+        for name, param in self.named_parameters():
+            if 'rand' not in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+                
+    def train_true(self):
+        for name, param in self.named_parameters():
+            if 'rand' not in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+                
+    def train_true_classifier(self):
+        for name, param in self.named_parameters():
+            if 'true' not in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+                
+    def train_encoder(self):
+        for name, param in self.named_parameters():
+            if 'classifier' in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+                
 class RandomGame(nn.Module):
     def __init__(self, model_func, num_class, multi_rand_layer=[], loss_type = 'softmax'):
         super(RandomGame, self).__init__()
@@ -67,6 +151,19 @@ class RandomGame(nn.Module):
             else:
                 param.requires_grad = False
                 
+    def train_true_classifier(self):
+        for name, param in self.named_parameters():
+            if 'true' not in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+                
+    def train_encoder(self):
+        for name, param in self.named_parameters():
+            if 'classifier' in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
 
 
 def init_layer(L):
@@ -351,7 +448,8 @@ class ResNet(nn.Module):
     def forward(self,x):
         out = self.trunk(x)
         return out
-
+def Conv2():
+    return ConvNet(2)
 def Conv4():
     return ConvNet(4)
 

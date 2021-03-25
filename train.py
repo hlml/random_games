@@ -14,8 +14,9 @@ import h5py
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from PIL import Image
+import wandb
 
-from models import LeNet, RandomGame
+from models import LeNet, MnistConvNet, RandomGame, RandomGamePos
 from dataset import MNISTCDataset
 
 data_path = '../datasets/'
@@ -46,7 +47,9 @@ def make_parser():
     parser.add_argument('--train_label_noise', type=float, default = 0, help='perc of label noise in train data')
     parser.add_argument('--decay_gamma_every', type=int, default=100, help='decay gamma every n iterations')
     parser.add_argument('--decay_gamma_rate', type=float, default=1, help='decay gamma by')
-    parser.add_argument('--simultaneous', action='store_true', help='simultaneously train random first and true second on the same batch')    
+    parser.add_argument('--simultaneous', action='store_true', help='simultaneously train random first and true second on the same batch')   
+    parser.add_argument('--train_separately', action='store_true', help='train encoder and classifiers separately for true')   
+    parser.add_argument('--pos_rand', action='store_true', help='use positive weights for random classifier')    
     parser.add_argument('--init_type', type=str, default = 'prev', choices=('prev','true','reinit'),
                         help='init type for rand training')   
     parser.add_argument('--random_per_batch', action='store_true', help='generate new random labels for every batch')
@@ -60,11 +63,13 @@ def make_parser():
     parser.add_argument('--l2', type=float, default=0, help='weight decay rate')
     
     parser.add_argument('--model_path', type=str, default=None, help='load a pretrained model from this path')
-    parser.add_argument('--save_path', type=str, default='exp', help='save model object to this path')
+    parser.add_argument('--save_path', type=str, default='exp_logged', help='save model object to this path')
     parser.add_argument('--print_every', type=int, default=100, help='print status update every n iterations')
     parser.add_argument('--save_every', type=int, default=1, help='save model every n epochs')
     parser.add_argument('--save_init_model', action='store_true', help='save initialization model state')
-
+    
+    parser.add_argument('--model_name', type=str, default='exp')
+    parser.add_argument("--group_vars", type=str, nargs='+', default="", help="variables used for grouping in wandb")
 
     #unused params
     parser.add_argument('--decay_lr', action='store_true', help='decay learning rate')
@@ -134,12 +139,12 @@ def train_true_loop(model, optimizer_T, inputs, labels, rand_labels, alpha, gamm
     
     true_loss, rand_loss, loss = get_all_loss(model, outputs_true, outputs_rand, labels, rand_labels, 
                                               alpha, gamma, mse_loss_func)
-    
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
     loss.backward()
     optimizer_T.step()
 #     return true_loss, rand_loss, loss
     
-def train_rand_loop(model, optimizer_R, inputs, rand_labels, init_type='prev', num_iter_rand_sb=1, mse_loss_func=None):
+def init_rand_weights(model, init_type='prev'):
     if init_type == 'true':
         cur_weights=[]
         for name, param in model.named_parameters():
@@ -152,26 +157,74 @@ def train_rand_loop(model, optimizer_R, inputs, rand_labels, init_type='prev', n
                 param.data=cur_weights[t]
                 t+=1
     elif init_type == 'reinit':
-        for name, layer in model.named_children():
-            if 'rand' in name:
-                layer[0].reset_parameters()
+        if isinstance(model, RandomGamePos):
+            for name, layer in model.named_children():
+                if 'rand' in name:
+                    layer.reset_parameters()
+        else:
+            for name, layer in model.named_children():
+                if 'rand' in name:
+                    layer[0].reset_parameters()
+                    
+                    
+def train_rand_loop(model, optimizer, inputs, rand_labels, pos_weight=False,
+                    reinit=False, init_type='prev', num_iter_rand_sb=1, mse_loss_func=None):
+    
+    if reinit:
+        init_rand_weights(model, init_type=init_type)
         
     model.train_rand()
     for k in range(num_iter_rand_sb):
-        optimizer_R.zero_grad()
+        optimizer.zero_grad()
         outputs_rand = model(inputs, False)
         if mse_loss_func is not None:
             rand_loss=mse_loss_func(outputs_rand, rand_labels)
         else:
             rand_loss=model.loss_fn(outputs_rand, rand_labels)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
         rand_loss.backward()
-        optimizer_R.step()
+        optimizer.step()
+        if pos_weight:
+            for p in model.rand_classifier.parameters():
+                p.data.clamp_(0)
 #     return rand_loss
+
+def train_true_classifier_loop(model, optimizer, inputs, labels, 
+                    init_type='prev', num_iter_rand_sb=1):
+    
+    if init_type == 'reinit':
+        for name, layer in model.named_children():
+            if 'true' in name:
+                layer.reset_parameters()
+        
+    model.train_true_classifier()
+    for k in range(num_iter_rand_sb):
+        optimizer.zero_grad()
+        outputs_true = model(inputs, True)
+        loss=model.loss_fn(outputs_true, labels)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
+        loss.backward()
+        optimizer.step()
+        
+def train_encoder_loop(model, optimizer, inputs, labels, rand_labels, alpha, gamma, mse_loss_func=None):
+    # zero the parameter gradients
+    model.train_encoder()
+    optimizer.zero_grad()        
+    
+    outputs_true = model(inputs, True)
+    outputs_rand = model(inputs, False)
+    
+    true_loss, rand_loss, loss = get_all_loss(model, outputs_true, outputs_rand, labels, rand_labels, 
+                                              alpha, gamma, mse_loss_func)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
+    loss.backward()
+    optimizer.step()
+#     return true_loss, rand_loss, loss
 
 
 def train(args, model, optimizer_T, optimizer_R, 
           trainloader, validloader, testloader, rand_labels_train, 
-          workdir, mse_loss_func=None):
+          workdir, mse_loss_func=None, optimizer_TC=None, optimizer_E=None):
     train_true = args.train_true
     iter_counter=0    
     
@@ -187,6 +240,10 @@ def train(args, model, optimizer_T, optimizer_R,
     total=0
     correct_rand=0
     
+    if args.consistent_rand:
+        new_mapping = dict(zip(range(args.num_classes), 
+                           np.random.choice(args.num_classes, args.num_classes, replace=False)))
+    
     for epoch in range(args.num_epochs):  # loop over the dataset multiple times
 
         running_loss = 0.0
@@ -196,6 +253,10 @@ def train(args, model, optimizer_T, optimizer_R,
     #     for i, data in enumerate(trainloader):
             model.train()
             inputs, labels = data
+            
+            if not args.random_per_batch and args.consistent_rand:
+                new_rand_labels = [new_mapping[x] for x in labels.numpy()]
+                rand_labels = torch.tensor(new_rand_labels)
             
             if args.random_per_batch:
                 if args.consistent_rand:
@@ -216,35 +277,81 @@ def train(args, model, optimizer_T, optimizer_R,
 
             #train for one iteration
             
+            #train simultaneously means training classifiers and then encoder (rand then true) on the same batch of data. this gives the classifiers a disadvantage because they go first, but maybe allow encoder to overfit more easily to the batch.
             if args.simultaneous:
-                if mse_loss_func is not None:
-                    train_rand_loop(model, optimizer_R, inputs, rand_labels_oh, init_type=args.init_type,
-                                    num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
-                    train_true_loop(model, optimizer_T, inputs, labels, rand_labels_oh,
-                                    args.alpha, args.gamma, mse_loss_func=mse_loss_func)
+                #if training separately, we train the classifiers first on the same batch of data, then train the encoder to maximize rand loss and minimize true loss
+                #not supporting mse for this type for now
+                if args.train_separately:
+                    if args.train_true:
+                        train_true_classifier_loop(model, optimizer_TC, inputs, labels,
+                                                   init_type='prev', num_iter_rand_sb=args.num_iter_rand_sb) #train one loop only for true
+                        train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
+                                        reinit=True, init_type=args.init_type,
+                                        num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
+                    else:
+                        train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
+                                        reinit=True, init_type=args.init_type,
+                                        num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
+                        train_true_classifier_loop(model, optimizer_TC, inputs, labels,
+                                                   init_type='prev', num_iter_rand_sb=args.num_iter_rand_sb) #train one loop only for true
+
+                    train_encoder_loop(model, optimizer_E, inputs, labels, rand_labels, 
+                                       args.alpha, args.gamma, mse_loss_func=mse_loss_func)
+                    
+                #if training together, first update random classifier, then update the true classifier and encoder in one step
                 else:
-                    train_rand_loop(model, optimizer_R, inputs, rand_labels, init_type=args.init_type,
-                                    num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
-                    train_true_loop(model, optimizer_T, inputs, labels, rand_labels,
-                                    args.alpha, args.gamma, mse_loss_func=mse_loss_func)
-                
-            else:
-                if train_true:
                     if mse_loss_func is not None:
+                        if not train_true:
+                            train_rand_loop(model, optimizer_R, inputs, rand_labels_oh, pos_weight=args.pos_rand,
+                                            reinit=True, init_type=args.init_type,
+                                            num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
                         train_true_loop(model, optimizer_T, inputs, labels, rand_labels_oh,
                                         args.alpha, args.gamma, mse_loss_func=mse_loss_func)
                     else:
+                        if not train_true:
+                            train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
+                                            reinit=True, init_type=args.init_type,
+                                            num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
                         train_true_loop(model, optimizer_T, inputs, labels, rand_labels,
                                         args.alpha, args.gamma, mse_loss_func=mse_loss_func)
+                
+            else:
+                if train_true:
+                    #if training separately, treat train_true as training the encoder
+                    if args.train_separately:
+                        train_encoder_loop(model, optimizer_E, inputs, labels, rand_labels, 
+                                           args.alpha, args.gamma, mse_loss_func=mse_loss_func)
+                    else:
+                        if mse_loss_func is not None:
+                            train_true_loop(model, optimizer_T, inputs, labels, rand_labels_oh,
+                                            args.alpha, args.gamma, mse_loss_func=mse_loss_func)
+                        else:
+                            train_true_loop(model, optimizer_T, inputs, labels, rand_labels,
+                                            args.alpha, args.gamma, mse_loss_func=mse_loss_func)
 
 
                 if not train_true:
-                    if mse_loss_func is not None:
-                        train_rand_loop(model, optimizer_R, inputs, rand_labels_oh, init_type=args.init_type,
+                    #for train_separately: not supporting reinit here for now, not supporting mse
+                    if args.train_separately:
+                        train_true_classifier_loop(model, optimizer_TC, inputs, labels,
+                                                   init_type=args.init_type, num_iter_rand_sb=1) #train one loop only for true
+                        train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
+                                        reinit=True, init_type=args.init_type,
                                         num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
+
                     else:
-                        train_rand_loop(model, optimizer_R, inputs, rand_labels, init_type=args.init_type,
-                                        num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
+                        if iter_counter == 0:
+                            reinit_flag = True
+                        else:
+                            reinit_flag = False
+                        if mse_loss_func is not None:
+                            train_rand_loop(model, optimizer_R, inputs, rand_labels_oh, pos_weight=args.pos_rand,
+                                            reinit=reinit_flag, init_type=args.init_type,
+                                            num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
+                        else:
+                            train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
+                                            reinit=reinit_flag, init_type=args.init_type,
+                                            num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
 
             #evaluate on true labels
             outputs_true = model(inputs, True)
@@ -298,6 +405,10 @@ def train(args, model, optimizer_T, optimizer_R,
                        running_loss_rand / args.print_every, running_loss_true / args.print_every, 
                        running_loss / args.print_every, 
                        correct.numpy() / total * 100, correct_rand.numpy() / total * 100, validloss, validacc, testloss, testacc, train_true, args.gamma))
+                
+
+                wandb.log({'Epoch': epoch + 1, 'Iter': i+1, 'Random Train Loss': running_loss_rand / args.print_every, 'Random Train Accuracy': correct_rand.numpy() / total * 100, 'True Train Loss': running_loss_true / args.print_every, 'Actual Train Loss': running_loss / args.print_every, 'True Train Accuracy': correct.numpy() / total * 100, 'Valid Loss': validloss, 'Valid Accuracy':validacc, 'Test Loss': testloss, 'Test Accuracy': testacc, 'Gamma':args.gamma})
+
 
                 running_loss = 0.0
                 running_loss_true = 0.0
@@ -367,14 +478,35 @@ def main():
     model_run_name = model_run_name + '_ep' + str(args.num_epochs)
     if args.simultaneous:
         model_run_name = model_run_name + '_simt'
+    if args.train_separately:
+        model_run_name = model_run_name + '_sep'
+    if args.consistent_rand:
+        model_run_name = model_run_name + '_csist'
+    if args.pos_rand:
+        model_run_name = model_run_name + '_posr'
     if args.random_per_batch:
         model_run_name = model_run_name + '_rpb'
+    model_run_name = model_run_name + '_seed' + str(args.seed)
     model_run_name = model_run_name + '_inittype' + args.init_type
     if args.model_path is not None:
         model_run_name = model_run_name + '_fromexist'
     else:
         model_run_name = model_run_name + '_fromfresh'
         
+        
+    if len(args.group_vars) > 0:
+        if len(args.group_vars) == 1:
+            group_name = args.group_vars[0] + str(getattr(args, args.group_vars[0]))
+        else:
+            group_name = args.group_vars[0] + str(getattr(args, args.group_vars[0]))
+            for var in args.group_vars[1:]:
+                group_name = group_name + '_' + var + str(getattr(args, var))
+        wandb.init(project="random_game",
+               group=args.model_name,
+               name=group_name)
+        for var in args.group_vars:
+            wandb.config.update({var:getattr(args, var)})
+            
     workdir = os.path.join(args.save_path, model_run_name)
     if not os.path.exists(workdir):
         os.makedirs(workdir)
@@ -402,7 +534,7 @@ def main():
         train_random_labels = torch.randint(0, args.num_classes, (num_random,))
         train_random_idx = np.random.choice(trainloader.dataset.indices, num_random)
         trainloader.dataset.dataset.targets[train_random_idx] = train_random_labels
-    
+
     rand_labels_raw = torch.randint(0, args.num_classes, fulltrainset.targets.shape)
     rand_labels_train, rand_labels_val = torch.utils.data.random_split(rand_labels_raw, [train_split, val_split])
 
@@ -423,7 +555,13 @@ def main():
     
     #initialize models
     if args.model_choice == 'lenet':
-        model = RandomGame(model_func=LeNet, num_class = args.num_classes, multi_rand_layer=multi_rand_layer)
+        if args.pos_rand:
+            model = RandomGamePos(model_func=LeNet, num_class = args.num_classes)
+        else:
+            model = RandomGame(model_func=LeNet, num_class = args.num_classes, multi_rand_layer=multi_rand_layer)
+            
+    elif args.model_choice == 'convnet':
+        model = RandomGame(model_func=MnistConvNet, num_class = args.num_classes, multi_rand_layer=multi_rand_layer)
         
     if args.model_path is not None:
         model_checkpoint = torch.load(args.model_path)
@@ -432,11 +570,19 @@ def main():
     if args.mse:
         mse_loss_fn = nn.MSELoss(reduction='mean')
     
-    true_parameters = list(model.feature.parameters()) + list(model.true_classifier.parameters())
+    
 
     # Optimizers
+    true_parameters = list(model.feature.parameters()) + list(model.true_classifier.parameters())
     optimizer_T = torch.optim.SGD(true_parameters, lr = args.lr_true, weight_decay=args.l2)
     optimizer_R = torch.optim.SGD(model.rand_classifier.parameters(), lr=args.lr_rand, weight_decay=args.l2)
+    
+    if args.train_separately:
+        optimizer_E = torch.optim.SGD(model.feature.parameters(), lr = args.lr_true, weight_decay=args.l2)
+        optimizer_TC = torch.optim.SGD(model.true_classifier.parameters(), lr = args.lr_true, weight_decay=args.l2)
+    else:
+        optimizer_E=None
+        optimizer_TC=None
     
     if args.save_init_model:
         outfile = os.path.join(workdir, 'init_model.tar')
@@ -447,7 +593,7 @@ def main():
 
     trainloss_all, trainacc_all, validloss_all, validacc_all, testloss_all, testacc_all = train(args, model, 
             optimizer_T, optimizer_R, trainloader, validloader, testloader, rand_labels_train, 
-            workdir, mse_loss_func=None)
+            workdir, mse_loss_func=None, optimizer_E=optimizer_E, optimizer_TC=optimizer_TC)
     
     #save metrics
     with h5py.File(os.path.join(workdir, 'perf_metrics.h5'), 'w') as f:
@@ -467,7 +613,7 @@ def main():
         el_dset[:] = np.array(testloss_all)
         ea_dset = f.create_dataset('test_acc', np.array(testacc_all).shape)
         ea_dset[:] = np.array(testacc_all)
-                              
+    wandb.run.finish()
                               
 if __name__ == '__main__':
     main()
