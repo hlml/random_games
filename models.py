@@ -49,6 +49,8 @@ class MnistConvNet(nn.Module):
         if flatten:
             trunk.append(Flatten())
         trunk.append(nn.Linear(784, 100))
+        trunk.append(nn.ReLU(inplace=True))
+        
         self.trunk = nn.Sequential(*trunk)
         self.final_feat_dim = 100
 

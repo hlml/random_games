@@ -54,13 +54,15 @@ def make_parser():
                         help='init type for rand training')   
     parser.add_argument('--random_per_batch', action='store_true', help='generate new random labels for every batch')
     parser.add_argument('--consistent_rand', action='store_true', help='generate consistent random labels for every batch')
+    parser.add_argument('--train_rand_true', action='store_true', help='train by predicting true labels with rand model')
     
     parser.add_argument('--mrl', type=str, default = None, help = 'comma-separated list for layers in rand classifier (if more than one)')
     
     parser.add_argument('--lr_true', type=float, default=.1, help='suggested: .01 sgd, .001 rmsprop, .0001 adam')        
     parser.add_argument('--lr_rand', type=float, default=.1, help='suggested: .01 sgd, .001 rmsprop, .0001 adam')    
     parser.add_argument('--opt', type=str, default='sgd', choices=('sgd', 'rmsprop', 'adam'))
-    parser.add_argument('--l2', type=float, default=0, help='weight decay rate')
+    parser.add_argument('--l2_true', type=float, default=0, help='weight decay rate')
+    parser.add_argument('--l2_rand', type=float, default=0, help='weight decay rate')
     
     parser.add_argument('--model_path', type=str, default=None, help='load a pretrained model from this path')
     parser.add_argument('--save_path', type=str, default='exp_logged', help='save model object to this path')
@@ -294,9 +296,12 @@ def train(args, model, optimizer_T, optimizer_R,
                                         num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func)
                         train_true_classifier_loop(model, optimizer_TC, inputs, labels,
                                                    init_type='prev', num_iter_rand_sb=args.num_iter_rand_sb) #train one loop only for true
-
-                    train_encoder_loop(model, optimizer_E, inputs, labels, rand_labels, 
-                                       args.alpha, args.gamma, mse_loss_func=mse_loss_func)
+                    if args.train_rand_true:
+                        train_encoder_loop(model, optimizer_E, inputs, labels, labels, 
+                                           args.alpha, -args.gamma, mse_loss_func=mse_loss_func)                        
+                    else:
+                        train_encoder_loop(model, optimizer_E, inputs, labels, rand_labels, 
+                                           args.alpha, args.gamma, mse_loss_func=mse_loss_func)
                     
                 #if training together, first update random classifier, then update the true classifier and encoder in one step
                 else:
@@ -361,8 +366,12 @@ def train(args, model, optimizer_T, optimizer_R,
                 true_loss, rand_loss, loss = get_all_loss(model, outputs_true, outputs_rand, labels, rand_labels_oh, 
                                                   args.alpha, args.gamma, mse_loss_func)
             else:
-                true_loss, rand_loss, loss = get_all_loss(model, outputs_true, outputs_rand, labels, rand_labels, 
-                                                  args.alpha, args.gamma, mse_loss_func)
+                if args.train_rand_true:
+                    true_loss, rand_loss, loss = get_all_loss(model, outputs_true, outputs_rand, labels, labels, 
+                                                      args.alpha, -args.gamma, mse_loss_func)
+                else:
+                    true_loss, rand_loss, loss = get_all_loss(model, outputs_true, outputs_rand, labels, rand_labels, 
+                                                      args.alpha, args.gamma, mse_loss_func)
 
             _, predicted = torch.max(nn.Softmax(dim=1)(outputs_true).data, 1)
             total += labels.size(0)
@@ -451,7 +460,11 @@ def main():
     
     #set random seeds
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.enabled = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 #     random.seed(args.seed)
     np.random.seed(args.seed)
     
@@ -486,6 +499,8 @@ def main():
         model_run_name = model_run_name + '_posr'
     if args.random_per_batch:
         model_run_name = model_run_name + '_rpb'
+    if args.train_rand_true:
+        model_run_name = model_run_name + '_tforr'
     model_run_name = model_run_name + '_seed' + str(args.seed)
     model_run_name = model_run_name + '_inittype' + args.init_type
     if args.model_path is not None:
@@ -574,12 +589,12 @@ def main():
 
     # Optimizers
     true_parameters = list(model.feature.parameters()) + list(model.true_classifier.parameters())
-    optimizer_T = torch.optim.SGD(true_parameters, lr = args.lr_true, weight_decay=args.l2)
-    optimizer_R = torch.optim.SGD(model.rand_classifier.parameters(), lr=args.lr_rand, weight_decay=args.l2)
+    optimizer_T = torch.optim.SGD(true_parameters, lr = args.lr_true, weight_decay=args.l2_true)
+    optimizer_R = torch.optim.SGD(model.rand_classifier.parameters(), lr=args.lr_rand, weight_decay=args.l2_rand)
     
     if args.train_separately:
-        optimizer_E = torch.optim.SGD(model.feature.parameters(), lr = args.lr_true, weight_decay=args.l2)
-        optimizer_TC = torch.optim.SGD(model.true_classifier.parameters(), lr = args.lr_true, weight_decay=args.l2)
+        optimizer_E = torch.optim.SGD(model.feature.parameters(), lr = args.lr_true, weight_decay=args.l2_true)
+        optimizer_TC = torch.optim.SGD(model.true_classifier.parameters(), lr = args.lr_true, weight_decay=args.l2_true)
     else:
         optimizer_E=None
         optimizer_TC=None
