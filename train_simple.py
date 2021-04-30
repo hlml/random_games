@@ -45,9 +45,11 @@ def make_parser():
     parser.add_argument('--alpha', type=float, default=1, help='weight of true loss')
     
     parser.add_argument('--train_label_noise', type=float, default = 0, help='perc of label noise in train data')
+    parser.add_argument('--train_mislabeled', type=float, default = 0, help='perc of mislabeled data points in train data')
     parser.add_argument('--decay_gamma_every', type=int, default=100, help='decay gamma every n iterations')
     parser.add_argument('--decay_gamma_rate', type=float, default=1, help='decay gamma by')
-    parser.add_argument('--simultaneous', action='store_true', help='simultaneously train random first and true second on the same batch')      
+    parser.add_argument('--simultaneous', action='store_true', help='simultaneously train random first and true second on the same batch')  
+    parser.add_argument('--clip_grad', action='store_true', help='clip gradients')  
     parser.add_argument('--pos_rand', action='store_true', help='use positive weights for random classifier')    
     parser.add_argument('--init_type', type=str, default = 'prev', choices=('prev','true','reinit'),
                         help='init type for rand training')   
@@ -184,7 +186,58 @@ def get_all_loss(model, outputs_true, outputs_rand, labels, rand_labels, alpha, 
     return true_loss, rand_loss, loss
 
 
-def train_true_loop(model, optimizer_T, inputs, labels, rand_labels, alpha, gamma, scheduler_T=None, mse_loss_func=None, no_jsd=True):
+def train_encoder_for_rand_loop(model, optimizer_E, inputs, rand_labels, no_jsd=True):
+    # zero the parameter gradients
+    model.train_encoder()
+    optimizer_E.zero_grad()        
+    
+    if not no_jsd:
+        rand_inputs = torch.split(inputs, rand_labels.size(0))[0]
+        outputs_rand = model(rand_inputs, False)
+    else:
+        outputs_rand = model(inputs, False)
+        
+    loss=-model.loss_fn(outputs_rand, rand_labels)
+    torch.nn.utils.clip_grad_norm_(model.feature.parameters(), 5)
+    loss.backward()
+    optimizer_E.step()
+#     return true_loss, rand_loss, loss
+
+
+def train_true_model_loop(model, optimizer_T, inputs, labels, scheduler_T=None, no_jsd=True):
+    model.train_true()
+
+    # zero the parameter gradients
+    optimizer_T.zero_grad()        
+
+    outputs_true = model(inputs, True)
+    
+    if no_jsd:
+        true_loss=model.loss_fn(outputs_true, labels)
+    else:
+        logits_clean, logits_aug1, logits_aug2 = torch.split(outputs_true, int(outputs_true.size(0)/3))
+        
+        # Cross-entropy is only computed on clean images
+        true_loss = F.cross_entropy(logits_clean, labels)
+
+        p_clean, p_aug1, p_aug2 = F.softmax(
+          logits_clean, dim=1), F.softmax(
+              logits_aug1, dim=1), F.softmax(
+                  logits_aug2, dim=1)
+
+        # Clamp mixture distribution to avoid exploding KL divergence
+        p_mixture = torch.clamp((p_clean + p_aug1 + p_aug2) / 3., 1e-7, 1).log()
+        true_loss += 12 * (F.kl_div(p_mixture, p_clean, reduction='batchmean') +
+                    F.kl_div(p_mixture, p_aug1, reduction='batchmean') +
+                    F.kl_div(p_mixture, p_aug2, reduction='batchmean')) / 3.
+        
+    true_loss.backward()
+    optimizer_T.step()
+    if scheduler_T is not None:
+        scheduler_T.step()
+#     return true_loss, rand_loss, loss
+
+def train_true_loop(model, optimizer_T, inputs, labels, rand_labels, alpha, gamma, scheduler_T=None, mse_loss_func=None, no_jsd=True, clip_grad=False):
     model.train_true()
 
     # zero the parameter gradients
@@ -200,7 +253,8 @@ def train_true_loop(model, optimizer_T, inputs, labels, rand_labels, alpha, gamm
     
     true_loss, rand_loss, loss = get_all_loss(model, outputs_true, outputs_rand, labels, rand_labels, 
                                               alpha, gamma, mse_loss_func, no_jsd)
-#     torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
+    if clip_grad:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
     loss.backward()
     optimizer_T.step()
     if scheduler_T is not None:
@@ -231,7 +285,7 @@ def init_rand_weights(model, init_type='prev'):
                     
                     
 def train_rand_loop(model, optimizer_R, inputs, rand_labels, scheduler_R=None, pos_weight=False,
-                    reinit=False, init_type='prev', num_iter_rand_sb=1, mse_loss_func=None, no_jsd=True):
+                    reinit=False, init_type='prev', num_iter_rand_sb=1, mse_loss_func=None, no_jsd=True, clip_grad=False):
     
     if reinit:
         init_rand_weights(model, init_type=init_type)
@@ -247,7 +301,8 @@ def train_rand_loop(model, optimizer_R, inputs, rand_labels, scheduler_R=None, p
             rand_loss=mse_loss_func(outputs_rand, rand_labels)
         else:
             rand_loss=model.loss_fn(outputs_rand, rand_labels)
-#         torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
+        if clip_grad:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
         rand_loss.backward()
         optimizer_R.step()
         if pos_weight:
@@ -258,8 +313,34 @@ def train_rand_loop(model, optimizer_R, inputs, rand_labels, scheduler_R=None, p
         scheduler_R.step()
 #     return rand_loss
 
+
+def get_model_state(model, epoch, optimizer_T, scheduler_T=None, optimizer_R=None, scheduler_R=None):
+    if scheduler_T is not None and scheduler_R is not None:
+        state = {
+            'epoch':           epoch,
+            'state_dict':      model.state_dict(),
+            'optimizer_T':     optimizer_T.state_dict(),
+            'scheduler_T':     scheduler_T.state_dict(),
+            'optimizer_R':     optimizer_R.state_dict(),
+            'scheduler_R':     scheduler_R.state_dict(),
+        }
+    elif optimizer_R is not None:
+        state = {
+            'epoch':           epoch,
+            'state_dict':      model.state_dict(),
+            'optimizer_T':     optimizer_T.state_dict(),
+            'optimizer_R':     optimizer_R.state_dict(),
+        }
+    else:
+        state = {
+            'epoch':           epoch,
+            'state_dict':      model.state_dict(),
+            'optimizer_T':     optimizer_T.state_dict(),
+        }
+    return state
+
 def train(args, model, optimizer_T, optimizer_R, trainloader, validloader, workdir, 
-          mse_loss_func=None, scheduler_T=None, scheduler_R=None):
+          mse_loss_func=None, scheduler_T=None, scheduler_R=None, optimizer_E=None):
     
     train_true = args.train_true
     iter_counter=0    
@@ -319,26 +400,50 @@ def train(args, model, optimizer_T, optimizer_R, trainloader, validloader, workd
             if args.simultaneous:
                 train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
                                 reinit=True, init_type=args.init_type, scheduler_R=scheduler_R,
-                                num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd)
+                                num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd, 
+                                clip_grad=args.clip_grad)
                 train_true_loop(model, optimizer_T, inputs, labels, rand_labels,
                                 args.alpha, args.gamma, 
-                                scheduler_T=scheduler_T, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd)
+                                scheduler_T=scheduler_T, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd,
+                                clip_grad=args.clip_grad)
                 
             else:
                 if train_true:
-                    train_true_loop(model, optimizer_T, inputs, labels, rand_labels, 
-                                    args.alpha, args.gamma, 
-                                    scheduler_T=scheduler_T, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd)
-
-
-                if not train_true:
+                    train_true_model_loop(model, optimizer_T, inputs, labels, scheduler_T=scheduler_T, no_jsd=args.no_jsd)
+                else:
                     if iter_counter == 0:
                         reinit_flag = True
                     else:
                         reinit_flag = False
-                    train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
-                                    reinit=reinit_flag, init_type=args.init_type, scheduler_R=scheduler_R,
-                                    num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd)
+                        
+                    if args.train_true:
+                        train_encoder_for_rand_loop(model, optimizer_E, inputs, rand_labels, no_jsd=args.no_jsd)
+                        
+                        train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
+                                        reinit=reinit_flag, init_type=args.init_type, scheduler_R=scheduler_R,
+                                        num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd)
+                    else:
+                        train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
+                                        reinit=reinit_flag, init_type=args.init_type, scheduler_R=scheduler_R,
+                                        num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd)
+                        
+                        train_encoder_for_rand_loop(model, optimizer_E, inputs, rand_labels, no_jsd=args.no_jsd)
+                        
+                        
+#                 if train_true:
+#                     train_true_loop(model, optimizer_T, inputs, labels, rand_labels, 
+#                                     args.alpha, args.gamma, 
+#                                     scheduler_T=scheduler_T, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd)
+
+
+#                 if not train_true:
+#                     if iter_counter == 0:
+#                         reinit_flag = True
+#                     else:
+#                         reinit_flag = False
+#                     train_rand_loop(model, optimizer_R, inputs, rand_labels, pos_weight=args.pos_rand,
+#                                     reinit=reinit_flag, init_type=args.init_type, scheduler_R=scheduler_R,
+#                                     num_iter_rand_sb=args.num_iter_rand_sb, mse_loss_func=mse_loss_func, no_jsd=args.no_jsd)
 
             #evaluate on true labels
             with torch.no_grad():
@@ -399,14 +504,15 @@ def train(args, model, optimizer_T, optimizer_R, trainloader, validloader, workd
 
         if epoch % args.save_every==0:
             outfile = os.path.join(workdir, '{:d}.tar'.format(epoch))
-            torch.save({'epoch':epoch, 'state_dict':model.state_dict()}, outfile)
+            torch.save(get_model_state(model, epoch, optimizer_T, scheduler_T, optimizer_R, scheduler_R), outfile)
     
     #save final model
     outfile = os.path.join(workdir, 'final_model.tar')
-    torch.save({'epoch':epoch, 'state_dict':model.state_dict()}, outfile)
+    torch.save(get_model_state(model, epoch, optimizer_T, scheduler_T, optimizer_R, scheduler_R), outfile)
 
     return trainloss_all, trainacc_all, validloss_all, validacc_all#, testloss_all, testacc_all
     
+
     
 def train_normal(args, model, optimizer_T, trainloader, validloader, workdir, scheduler_T=None):
     
@@ -465,8 +571,8 @@ def train_normal(args, model, optimizer_T, trainloader, validloader, workdir, sc
             else:
                 true_loss=model.loss_fn(outputs_true, labels)
         
-            
-#             torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
+            if args.clip_grad:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
             true_loss.backward()
             optimizer_T.step()
             if scheduler_T is not None:
@@ -508,11 +614,11 @@ def train_normal(args, model, optimizer_T, trainloader, validloader, workdir, sc
 
         if epoch % args.save_every==0:
             outfile = os.path.join(workdir, '{:d}.tar'.format(epoch))
-            torch.save({'epoch':epoch, 'state_dict':model.state_dict()}, outfile)
+            torch.save(get_model_state(model, epoch, optimizer_T, scheduler_T), outfile)
     
     #save final model
     outfile = os.path.join(workdir, 'final_model.tar')
-    torch.save({'epoch':epoch, 'state_dict':model.state_dict()}, outfile)
+    torch.save(get_model_state(model, epoch, optimizer_T, scheduler_T), outfile)
 
     return trainloss_all, trainacc_all, validloss_all, validacc_all#, testloss_all, testacc_all
     
@@ -603,6 +709,9 @@ def main():
 #     random.seed(args.seed)
     np.random.seed(args.seed)
     
+    if not args.use_augmix:
+        args.no_jsd = True
+    
     #model name creation
     model_run_name=args.train_data
 #     if args.test_data is not None:
@@ -649,6 +758,8 @@ def main():
         model_run_name = model_run_name + '_fromexist'
     else:
         model_run_name = model_run_name + '_fromfresh'
+    if args.clip_grad:
+        model_run_name = model_run_name + '_clipg'
         
         
     if len(args.group_vars) > 0:
@@ -673,7 +784,9 @@ def main():
     if args.train_data == 'mnist':
         trans = ([transforms.ToTensor()])
         train_transform = transforms.Compose(trans)
-        
+        preprocess = transforms.Compose(
+          [transforms.ToTensor(),
+           transforms.Normalize([0.5], [0.5])])
     if args.train_data == 'cifar10':
         if args.use_augmix:
             # Load datasets
@@ -712,7 +825,7 @@ def main():
     if args.train_label_noise > 0:
         num_random = int(train_split * args.train_label_noise)
         train_random_labels = torch.randint(0, args.num_classes, (num_random,))
-        train_random_idx = np.random.choice(trainloader.dataset.indices, num_random)
+        train_random_idx = np.random.choice(trainloader.dataset.indices, num_random, replace=False)
         if args.train_data == 'mnist':
             trainloader.dataset.dataset.targets[train_random_idx] = train_random_labels
         
@@ -720,6 +833,16 @@ def main():
             temp_targets = torch.tensor(trainloader.dataset.dataset.targets)
             temp_targets[train_random_idx] = train_random_labels
             trainloader.dataset.dataset.targets=list(temp_targets.numpy())
+            
+    if args.train_mislabeled > 0:
+        num_random = int(train_split * args.train_mislabeled)
+        train_random_idx = np.random.choice(trainloader.dataset.indices, num_random, replace=False)
+        
+        new_mapping = dict(zip(range(args.num_classes), 
+                           np.random.choice(args.num_classes, args.num_classes, replace=False)))
+
+        train_random_labels = [new_mapping[x] for x in trainloader.dataset.dataset.targets[train_random_idx].numpy()]
+        trainloader.dataset.dataset.targets[train_random_idx] = torch.tensor(train_random_labels)
     
 #     if args.test_data is not None:
 #         if args.train_data == 'mnist':
@@ -746,10 +869,7 @@ def main():
         if args.train_data == 'cifar10':
             model = RandomGame(model_func=WideResNet, num_class = args.num_classes, multi_rand_layer=multi_rand_layer,
                               depth=40, num_classes=args.num_classes, widen_factor=2, dropRate=0.0)
-        
-    if args.model_path is not None:
-        model_checkpoint = torch.load(args.model_path)
-        model.load_state_dict(model_checkpoint['state_dict'])
+
     
     if args.mse:
         mse_loss_fn = nn.MSELoss(reduction='mean')
@@ -762,6 +882,11 @@ def main():
         nest_true = False
     optimizer_T = torch.optim.SGD(true_parameters, lr = args.lr_true, momentum=args.mom_true, weight_decay=args.l2_true, nesterov=nest_true)
     
+    if not args.simultaneous:
+        optimizer_E = torch.optim.SGD(model.feature.parameters(),  lr = args.lr_true, momentum=args.mom_true, weight_decay=args.l2_true, nesterov=nest_true)
+    else:
+        optimizer_E=None
+    
     if args.mom_rand > 0:
         nest_rand = True
     else:
@@ -769,29 +894,46 @@ def main():
     optimizer_R = torch.optim.SGD(model.rand_classifier.parameters(), lr=args.lr_rand, momentum=args.mom_true, weight_decay=args.l2_rand, nesterov=nest_rand)
     
     
+
+    
+    
     def cosine_annealing(step, total_steps, lr_max, lr_min):
         return lr_min + (lr_max - lr_min) * 0.5 * (
                 1 + np.cos(step / total_steps * np.pi))
 
 
-    scheduler_T = torch.optim.lr_scheduler.LambdaLR(
-        optimizer_T,
-        lr_lambda=lambda step: cosine_annealing(
-            step,
-            args.num_epochs * len(trainloader),
-            1,  # since lr_lambda computes multiplicative factor
-            1e-6 / args.lr_true))
+    if args.train_data == 'mnist':
+        scheduler_T=None
+        scheduler_R=None
+    else:
+        scheduler_T = torch.optim.lr_scheduler.LambdaLR(
+            optimizer_T,
+            lr_lambda=lambda step: cosine_annealing(
+                step,
+                args.num_epochs * len(trainloader),
+                1,  # since lr_lambda computes multiplicative factor
+                1e-6 / args.lr_true))
+
+        scheduler_R = torch.optim.lr_scheduler.LambdaLR(
+            optimizer_R,
+            lr_lambda=lambda step: cosine_annealing(
+                step,
+                args.num_epochs * len(trainloader),
+                1,  # since lr_lambda computes multiplicative factor
+                1e-6 / args.lr_rand))
     
-    scheduler_R = torch.optim.lr_scheduler.LambdaLR(
-        optimizer_R,
-        lr_lambda=lambda step: cosine_annealing(
-            step,
-            args.num_epochs * len(trainloader),
-            1,  # since lr_lambda computes multiplicative factor
-            1e-6 / args.lr_rand))
-    
-    
-    if args.save_init_model:
+            
+    if args.model_path is not None:
+        model_checkpoint = torch.load(args.model_path)
+        model.load_state_dict(model_checkpoint['state_dict'])
+        optimizer_T.load_state_dict(model_checkpoint['optimizer_T'])
+        if not args.train_normal:
+            optimizer_R.load_state_dict(model_checkpoint['optimizer_R'])
+        if args.train_data != 'mnist':
+            scheduler_T.load_state_dict(model_checkpoint['scheduler_T'])
+            scheduler_R.load_state_dict(model_checkpoint['scheduler_R'])
+
+    if args.save_init_model and args.model_path is None:
         outfile = os.path.join(workdir, 'init_model.tar')
         torch.save({'epoch':-1, 'state_dict':model.state_dict()}, outfile)
                               
@@ -807,7 +949,7 @@ def main():
         trainloss_all, trainacc_all, validloss_all, validacc_all = train(args, model, 
                 optimizer_T, optimizer_R, trainloader, validloader, 
                 workdir, mse_loss_func=None, 
-                scheduler_T=scheduler_T, scheduler_R=scheduler_R)
+                scheduler_T=scheduler_T, scheduler_R=scheduler_R, optimizer_E=optimizer_E)
     
     #save metrics
     with h5py.File(os.path.join(workdir, 'perf_metrics.h5'), 'w') as f:
