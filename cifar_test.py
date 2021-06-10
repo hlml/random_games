@@ -25,7 +25,7 @@ def make_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_normal', action='store_true', help='train baseline model without game')  
     parser.add_argument('--epoch', type=int, default=10, help='number of epochs')
-    parser.add_argument('--severity', type=int, default=0, help='number of epochs')
+    parser.add_argument('--severity', type=int, default=0, help='0 for all severity')
     parser.add_argument('--init_type', type=str, default = 'prev', choices=('prev','true','reinit'),
                         help='init type for rand training')  
     parser.add_argument('--use_augmix', action='store_true', help='train with augmix data augmentation')
@@ -153,11 +153,11 @@ def main():
         
     if args.use_augmix:
         if args.no_jsd:
-            model_name2 = '_AUGMIX_mw3_md-1_sev3_fromfresh'
+            model_name2 = '_AUGMIX_mw3_md-1_sev3_fromfresh_clipg'
         else:
-            model_name2 = '_AUGMIX_mw3_md-1_sev3_jsd_fromfresh'            
+            model_name2 = '_AUGMIX_mw3_md-1_sev3_jsd_fromfresh_clipg'            
     else:
-        model_name2 = '_fromfresh'
+        model_name2 = '_fromfresh_clipg'
 
 
     if args.epoch == 100:
@@ -175,7 +175,7 @@ def main():
 
         for seed in range(5):
 
-            model_checkpoint = torch.load('/home/hattie/random_games/clean_exp_cifar_fast/' + model_name + str(seed) + '_inittype' + args.init_type + model_name2 + '/' + str(args.epoch) + '.tar')
+            model_checkpoint = torch.load('/home/hattie/random_games/clean_exp_cifar_fast_clip/' + model_name + str(seed) + '_inittype' + args.init_type + model_name2 + '/' + str(args.epoch) + '.tar')
 
             model.load_state_dict(model_checkpoint['state_dict'])
             loss, acc = test(trainloader, model, save=False, bn_eval=False)
@@ -184,7 +184,7 @@ def main():
 
 
     #save metrics
-    save_path = '/home/hattie/random_games/clean_exp_cifar_fast_PERF/' + model_name + str(0) + '_inittype' + args.init_type + model_name2 + '/'
+    save_path = '/home/hattie/random_games/clean_exp_cifar_fast_clip_PERF/' + model_name + str(0) + '_inittype' + args.init_type + model_name2 + '/'
     if not os.path.exists(save_path):
         os.makedirs(save_path)
     print('saving to workdir %s' % save_path)

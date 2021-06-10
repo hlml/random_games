@@ -212,12 +212,12 @@ class RandomGame(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(self, x, true_flag):
-        embedding  = self.feature.forward(x)
+        self.embedding  = self.feature.forward(x)
         
         if true_flag:
-            out = self.true_classifier.forward(embedding)
+            out = self.true_classifier.forward(self.embedding)
         else:
-            out = self.rand_classifier.forward(embedding)
+            out = self.rand_classifier.forward(self.embedding)
         return out
     
     def train_rand(self):

@@ -54,6 +54,7 @@ def make_parser():
     parser.add_argument('--init_type', type=str, default = 'prev', choices=('prev','true','reinit'),
                         help='init type for rand training')   
     parser.add_argument('--consistent_rand', action='store_true', help='generate consistent random labels for every batch')
+    parser.add_argument('--new_rand', action='store_true', help='generate new random labels for every batch')
     parser.add_argument('--train_normal', action='store_true', help='train baseline model without game')   
 #     parser.add_argument('--repeat_rand', action='store_true', help='use copies of random labels for augmix jsd training')    
     
@@ -296,7 +297,10 @@ def train_rand_loop(model, optimizer_R, inputs, rand_labels, scheduler_R=None, p
     model.train_rand()
     for k in range(num_iter_rand_sb):
         optimizer_R.zero_grad()
-        outputs_rand = model(inputs, False)
+        if k > 0:
+            outputs_rand = model.rand_classifier.forward(model.embedding)
+        else:
+            outputs_rand = model(inputs, False)
         if mse_loss_func is not None:
             rand_loss=mse_loss_func(outputs_rand, rand_labels)
         else:
@@ -339,7 +343,7 @@ def get_model_state(model, epoch, optimizer_T, scheduler_T=None, optimizer_R=Non
         }
     return state
 
-def train(args, model, optimizer_T, optimizer_R, trainloader, validloader, workdir, 
+def train(args, model, optimizer_T, optimizer_R, trainloader, validloader, rand_labels_train, workdir, 
           mse_loss_func=None, scheduler_T=None, scheduler_R=None, optimizer_E=None):
     
     train_true = args.train_true
@@ -364,15 +368,15 @@ def train(args, model, optimizer_T, optimizer_R, trainloader, validloader, workd
         running_loss = 0.0
         running_loss_true = 0.0
         running_loss_rand = 0.0
-        for i, data in enumerate(trainloader):
-    #     for i, data in enumerate(trainloader):
+#         for i, data in enumerate(trainloader):
+        for i, (data, rand_labels) in enumerate(zip(trainloader, rand_labels_train), 0):
             model.train()
             inputs, labels = data
             
             if not args.no_jsd and args.use_augmix:
                 inputs = torch.cat(inputs, 0)
                 
-            #always do random per batch in this version
+            #always do fixed random labels in this version
             if args.consistent_rand:
                 new_mapping = dict(zip(range(args.num_classes), 
                                        np.random.choice(args.num_classes, args.num_classes, replace=False)))
@@ -381,14 +385,20 @@ def train(args, model, optimizer_T, optimizer_R, trainloader, validloader, workd
 #                 else:
                 new_rand_labels = [new_mapping[x] for x in labels.numpy()]
                 rand_labels = torch.tensor(new_rand_labels)
-            else:
+            if args.new_rand:
+                new_rand_label = np.zeros(labels.shape)
+                for i in range(args.num_classes):
+                    new_rand_label[torch.where(labels.cpu() == i)[0]] = np.random.choice([x for x in range(args.num_classes) if x != i],len(torch.where(labels.cpu() == i)[0]))
+                rand_labels = torch.tensor(new_rand_label, dtype=int)
+#                 rand_labels = torch.randint(0, args.num_classes, labels.shape)
+#             else:
 #                 if not args.no_jsd and args.use_augmix:
 #                     if args.repeat_rand:
 #                         rand_labels = torch.randint(0, args.num_classes, labels.shape).repeat(3)
 #                     else:
 #                         rand_labels = torch.randint(0, args.num_classes, [labels.size(0)*3])
 #                 else:
-                rand_labels = torch.randint(0, args.num_classes, labels.shape)
+#                 rand_labels = torch.randint(0, args.num_classes, labels.shape)
 
             #remove mse_loss
             if use_cuda:
@@ -743,6 +753,8 @@ def main():
         model_run_name = model_run_name + '_simt'
     if args.consistent_rand:
         model_run_name = model_run_name + '_csist'
+    if args.new_rand:
+        model_run_name = model_run_name + '_newrand'
     if args.pos_rand:
         model_run_name = model_run_name + '_posr'
     model_run_name = model_run_name + '_seed' + str(args.seed)
@@ -771,7 +783,7 @@ def main():
             group_name = args.group_vars[0] + str(getattr(args, args.group_vars[0]))
             for var in args.group_vars[1:]:
                 group_name = group_name + '_' + var + str(getattr(args, var))
-        wandb.init(project="random_game_fast",
+        wandb.init(project="random_game_fast_v2",
                group=args.model_name,
                name=group_name)
         for var in args.group_vars:
@@ -819,9 +831,27 @@ def main():
         train_set = AugMixDataset(train_set, preprocess, no_jsd=args.no_jsd)
         valset = NonAugMixDataset(valset, preprocess)
 
-    trainloader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    trainloader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
     validloader = torch.utils.data.DataLoader(valset, batch_size=args.batch_size, shuffle=False,
                                               num_workers=4, pin_memory=True)
+    
+    if not args.train_normal:
+        print('creating random labels')
+        #make persistent random labels
+        if args.train_data == 'mnist':
+            rand_labels_raw = torch.randint(0, args.num_classes, fulltrainset.targets.shape)
+        if args.train_data == 'cifar10':
+            new_rand_label = np.zeros(len(fulltrainset.targets))
+            for i in range(10):
+                new_rand_label[np.where(np.array(fulltrainset.targets) == i)[0]] = np.random.choice([x for x in range(10) if x != i],5000)
+            rand_labels_raw = torch.tensor(new_rand_label, dtype=int)
+#             rand_labels_raw = torch.randint(0, args.num_classes, (len(fulltrainset.targets),))
+        rand_labels_train, rand_labels_val = torch.utils.data.random_split(rand_labels_raw, [train_split, val_split])
+
+        rand_labels_train = torch.utils.data.DataLoader(rand_labels_train, batch_size=args.batch_size, 
+                                                        shuffle=False, num_workers=4, pin_memory=True)
+    #     rand_labels_val = torch.utils.data.DataLoader(rand_labels_val, batch_size=args.batch_size, 
+    #                                                   shuffle=False, num_workers=4, pin_memory=True)
     
     #add label noise to train if needed
     if args.train_label_noise > 0:
@@ -949,7 +979,7 @@ def main():
                 scheduler_T=scheduler_T)
     else:
         trainloss_all, trainacc_all, validloss_all, validacc_all = train(args, model, 
-                optimizer_T, optimizer_R, trainloader, validloader, 
+                optimizer_T, optimizer_R, trainloader, validloader, rand_labels_train,
                 workdir, mse_loss_func=None, 
                 scheduler_T=scheduler_T, scheduler_R=scheduler_R, optimizer_E=optimizer_E)
     
