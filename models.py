@@ -62,9 +62,9 @@ class WideResNet(nn.Module):
         # global average pooling and classifier
         self.bn1 = nn.BatchNorm2d(nChannels[3])
         self.relu = nn.ReLU(inplace=True)
-#         self.fc = nn.Linear(nChannels[3], num_classes)
-        self.nChannels = nChannels[3]
-        self.final_feat_dim = nChannels[3]
+        self.fc = nn.Linear(nChannels[3], num_classes)
+#         self.nChannels = nChannels[3]
+#         self.final_feat_dim = nChannels[3]
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -82,7 +82,7 @@ class WideResNet(nn.Module):
         out = self.relu(self.bn1(out))
         out = F.avg_pool2d(out, 8)
         out = out.view(-1, self.nChannels)
-        return out#self.fc(out)
+        return self.fc(out)
 
 #https://discuss.pytorch.org/t/positive-weights/19701/3
 class PositiveLinear(nn.Module):
